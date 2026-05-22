@@ -1,37 +1,35 @@
-name: ChromElevator Build
-
-on: [push]
-
-jobs:
-  build:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Run Build
-        shell: cmd
+  - name: Debug - list build outputs
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
         run: |
-          :: Execute your build system
-          call make.bat
+          Write-Host "===== Current directory ====="
+          Get-Location
 
-      - name: Diagnostic File Listing
-        shell: cmd
-        run: |
-          echo "Listing current directory:"
-          dir /s /b
-          echo "Listing build directory:"
-          dir /s /b build\
+          Write-Host "`n===== GITHUB_WORKSPACE ====="
+          Write-Host $env:GITHUB_WORKSPACE
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ChromElevator-Release
-          path: |
-            chromelevator.exe
-            build/chrome_decrypt.dll
-            build/chrome_decrypt.enc
-          if-no-files-found: error
+          Write-Host "`n===== Top-level contents ====="
+          Get-ChildItem -Force | Format-Table Mode, LastWriteTime, Length, Name -AutoSize
+
+          Write-Host "`n===== All .exe files ====="
+          Get-ChildItem -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+
+          Write-Host "`n===== All .dll files ====="
+          Get-ChildItem -Recurse -Filter *.dll -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+
+          Write-Host "`n===== All .enc files ====="
+          Get-ChildItem -Recurse -Filter *.enc -ErrorAction SilentlyContinue |
+            Select-Object FullName, Length, LastWriteTime |
+            Format-Table -AutoSize
+
+          Write-Host "`n===== Anything in build/ (if it exists) ====="
+          if (Test-Path build) {
+            Get-ChildItem -Path build -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+          } else {
+            Write-Host "No 'build' directory at workspace root."
+          }
+        continue-on-error: true
