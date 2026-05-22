@@ -17,8 +17,13 @@ jobs:
         run: |
           make.bat
 
+      - name: Verify Build Output
+        shell: cmd
+        run: |
+          dir chromelevator.exe
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ChromElevator-Release
-          path: build/chromelevator_x64.exe
+          path: chromelevator.exe
