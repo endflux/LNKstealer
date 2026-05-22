@@ -1,0 +1,37 @@
+name: ChromElevator Build
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Run Build
+        shell: cmd
+        run: |
+          :: Execute your build system
+          call make.bat
+
+      - name: Diagnostic File Listing
+        shell: cmd
+        run: |
+          echo "Listing current directory:"
+          dir /s /b
+          echo "Listing build directory:"
+          dir /s /b build\
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChromElevator-Release
+          path: |
+            chromelevator.exe
+            build/chrome_decrypt.dll
+            build/chrome_decrypt.enc
+          if-no-files-found: error
