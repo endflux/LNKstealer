@@ -1,2 +1,0 @@
-# LNK-stealer-
-# LNKstealer

@@ -1,0 +1,35 @@
+name: Build LNK Payload
+
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Clone DarkLnk
+        run: git clone https://github.com/wariv/DarkLnk.git
+        shell: powershell
+
+      - name: Build DarkLnk
+        run: dotnet build DarkLnk/DarkLnk.sln --configuration Release
+        shell: powershell
+
+      - name: Run DarkLnk
+        run: |
+          $exe = Get-ChildItem -Recurse DarkLnk -Filter "DarkLnk.exe" | Select-Object -First 1
+          Write-Host "Found exe at: $($exe.FullName)"
+          & $exe.FullName --help
+        shell: powershell
+
+      - name: List all output files
+        run: Get-ChildItem -Recurse $env:GITHUB_WORKSPACE | Select-Object FullName
+        shell: powershell
+
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        with:
+          name: lnk-payload
+          path: "**/*.lnk"
