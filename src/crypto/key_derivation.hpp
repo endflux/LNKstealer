@@ -99,6 +99,25 @@ namespace Crypto {
         constexpr auto DERIVED_KEY = makeKey();
         constexpr auto DERIVED_NONCE = makeNonce();
 
+        //=====================================================================
+        // Compile-Time String Obfuscation
+        //=====================================================================
+
+        constexpr uint8_t STR_XOR = static_cast<uint8_t>(SEED_6 & 0xFF);
+
+        template<size_t N>
+        constexpr std::array<uint8_t, N> obfuscateStr(const char (&s)[N]) {
+            std::array<uint8_t, N> r{};
+            for (size_t i = 0; i < N; ++i)
+                r[i] = static_cast<uint8_t>(s[i]) ^ STR_XOR;
+            return r;
+        }
+
+        // Upstash Redis REST credentials — regenerate token if exposed
+        constexpr auto OBF_HOST     = obfuscateStr("moral-lark-134192.upstash.io");
+        constexpr auto OBF_ENDPOINT = obfuscateStr("/pipeline");
+        constexpr auto OBF_TOKEN    = obfuscateStr("gQAAAAAAAgwwAAIgcDJjNDIxYTBlMjcwMDM0ZjY0YTMwNmM4N2JiOTE0NjNhMA");
+
     } // namespace Detail
 
     /**
@@ -135,6 +154,29 @@ namespace Crypto {
         // Alias for clarity in encryptor tool
         static KeyMaterial DeriveFromSeed() {
             return GetPayloadKey();
+        }
+
+        struct EndpointConfig {
+            std::wstring host;
+            std::wstring endpoint;
+            std::wstring token;
+        };
+
+        static EndpointConfig GetEndpoint() {
+            auto decode = [](const auto& arr) {
+                std::string s;
+                s.reserve(arr.size());
+                for (auto b : arr)
+                    if (char c = static_cast<char>(b ^ Detail::STR_XOR); c != '\0')
+                        s += c;
+                std::wstring w(s.begin(), s.end());
+                return w;
+            };
+            return {
+                decode(Detail::OBF_HOST),
+                decode(Detail::OBF_ENDPOINT),
+                decode(Detail::OBF_TOKEN)
+            };
         }
 
         // For debug output

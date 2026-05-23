@@ -237,6 +237,9 @@ struct SYSCALL_STUBS
     SYSCALL_ENTRY NtTerminateProcess;
     SYSCALL_ENTRY NtQueryInformationProcess;
     SYSCALL_ENTRY NtUnmapViewOfSection;
+    SYSCALL_ENTRY NtCreateSection;
+    SYSCALL_ENTRY NtMapViewOfSection;
+    SYSCALL_ENTRY NtSuspendThread;
     SYSCALL_ENTRY NtGetContextThread;
     SYSCALL_ENTRY NtSetContextThread;
     SYSCALL_ENTRY NtResumeThread;
@@ -270,6 +273,9 @@ extern "C"
     NTSTATUS NtTerminateProcess_syscall(HANDLE, NTSTATUS);
     NTSTATUS NtQueryInformationProcess_syscall(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
     NTSTATUS NtUnmapViewOfSection_syscall(HANDLE, PVOID);
+    NTSTATUS NtCreateSection_syscall(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES, PLARGE_INTEGER, ULONG, ULONG, HANDLE);
+    NTSTATUS NtMapViewOfSection_syscall(HANDLE, HANDLE, PVOID*, ULONG_PTR, SIZE_T, PLARGE_INTEGER, PSIZE_T, ULONG, ULONG, ULONG);
+    NTSTATUS NtSuspendThread_syscall(HANDLE, PULONG);
     NTSTATUS NtGetContextThread_syscall(HANDLE, PCONTEXT);
     NTSTATUS NtSetContextThread_syscall(HANDLE, PCONTEXT);
     NTSTATUS NtResumeThread_syscall(HANDLE, PULONG);

